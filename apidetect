@@ -1,0 +1,72 @@
+import { type VercelRequest, type VercelResponse } from "vercel";
+import { fetch } from "undici";
+
+const CLARIFAI_KEY = process.env.CLARIFAI_API_KEY || "";
+const CLARIFAI_MODEL_ID = process.env.CLARIFAI_MODEL_ID || "";
+const CLARIFAI_URL = (model: string) => `https://api.clarifai.com/v2/models/${model}/outputs`;
+
+async function clarifyImage(input: { image_b64?: string; image_url?: string }) {
+  const data: any = {
+    inputs: [
+      {
+        data: {
+          image: input.image_b64
+            ? { base64: input.image_b64 }
+            : { url: input.image_url }
+        }
+      }
+    ]
+  };
+
+  const r = await fetch(CLARIFAI_URL(CLARIFAI_MODEL_ID), {
+    method: "POST",
+    headers: {
+      "Authorization": `Key ${CLARIFAI_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(data)
+  });
+
+  const json: any = await r.json();
+
+  const concepts = json?.outputs?.[0]?.data?.concepts || [];
+  const ai = concepts.find((c: any) => /ai|generated|fake/i.test(c.name)) || concepts[0];
+
+  return {
+    ai_score: Number(ai?.value ?? 0.5),
+    reasons: concepts.slice(0, 3).map((c: any) => `${c.name} ${Math.round((c.value || 0)*100)}%`)
+  };
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  try {
+    if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+
+    const { type, image_b64, image_url, frames_b64 } = req.body || {};
+
+    if (type === "image") {
+      const result = await clarifyImage({ image_b64, image_url });
+      return res.json(result);
+    }
+
+    if (type === "video") {
+      const per = [];
+      for (const b64 of frames_b64) {
+        const r = await clarifyImage({ image_b64: b64 });
+        per.push(r.ai_score);
+      }
+      const mean = per.reduce((a, b) => a + b, 0) / per.length;
+      const max = Math.max(...per);
+      return res.json({
+        ai_score: mean * 0.7 + max * 0.3,
+        reasons: [`mean:${mean.toFixed(2)}`, `max:${max.toFixed(2)}`],
+        per_frame: per
+      });
+    }
+
+    return res.status(400).json({ error: "unknown type" });
+
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || "server_error" });
+  }
+}
